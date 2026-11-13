@@ -1,0 +1,3 @@
+# Let the logged-in user read the Bluetooth HID head trackers of Sony headsets (vendor 054C: WF/WH-1000XM5/XM6, LinkBuds, ULT WEAR ...).
+# uaccess = ACL for the active local session; no group membership. Only Bluetooth (bus 0005) Sony HID devices are touched.
+SUBSYSTEM=="hidraw", KERNELS=="0005:054C:*", TAG+="uaccess"

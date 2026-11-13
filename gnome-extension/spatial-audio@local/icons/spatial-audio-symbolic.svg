@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="16" height="16" viewBox="0 0 16 16">
+  <!-- head and shoulders -->
+  <circle cx="8" cy="6" r="2.4" fill="#2e3436"/>
+  <path d="M4.3 14.4c0-2.7 1.6-4.3 3.7-4.3s3.7 1.6 3.7 4.3z" fill="#2e3436"/>
+  <!-- sound field either side: heavy arcs so they stay visible at panel size -->
+  <path d="M3.3 3.6a4.4 4.4 0 0 0 0 4.8" fill="none" stroke="#2e3436" stroke-width="1.7" stroke-linecap="round"/>
+  <path d="M12.7 3.6a4.4 4.4 0 0 1 0 4.8" fill="none" stroke="#2e3436" stroke-width="1.7" stroke-linecap="round"/>
+  <path d="M1.2 2a7.2 7.2 0 0 0 0 8" fill="none" stroke="#2e3436" stroke-width="1.7" stroke-linecap="round"/>
+  <path d="M14.8 2a7.2 7.2 0 0 1 0 8" fill="none" stroke="#2e3436" stroke-width="1.7" stroke-linecap="round"/>
+</svg>

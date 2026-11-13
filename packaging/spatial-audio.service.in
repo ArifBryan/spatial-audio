@@ -1,0 +1,16 @@
+[Unit]
+Description=Head-tracked spatial audio for Sony earbuds
+After=pipewire.service wireplumber.service
+Wants=pipewire.service wireplumber.service
+PartOf=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=@BUILD@/spatial-daemon
+KillMode=control-group
+TimeoutStopSec=8
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=graphical-session.target

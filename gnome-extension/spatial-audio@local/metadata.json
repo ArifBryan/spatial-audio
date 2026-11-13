@@ -1,0 +1,7 @@
+{
+  "uuid": "spatial-audio@local",
+  "name": "Spatial Audio",
+  "description": "Quick Settings toggle for head-tracked spatial audio on compatible Sony earbuds. Available only when the selected output is compatible stereo earbuds.",
+  "shell-version": ["50"],
+  "version": 1
+}
