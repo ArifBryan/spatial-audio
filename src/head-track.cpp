@@ -241,16 +241,19 @@ int main(int argc, char** argv) {
     if (opt.stillSecs <= 0) opt.stillSecs = 1e12;
     const double SIGN = opt.invert ? -1.0 : 1.0;
 
+    // Block the signals BEFORE PipeWire starts its threads (they inherit the mask); otherwise a thread without the mask takes the
+    // signal's default action and kills the process instead of letting the loop fade out.
+    sigset_t mask; sigemptyset(&mask);
+    for (int s : {SIGUSR2, SIGHUP, SIGTERM, SIGINT}) sigaddset(&mask, s);
+    sigprocmask(SIG_BLOCK, &mask, nullptr);
+    int sfd = signalfd(-1, &mask, SFD_CLOEXEC);
+
     if (!pw.connect(opt.node)) { fprintf(stderr, "cannot reach PipeWire node %d\n", opt.node); return 1; }
     int sock = socket(AF_INET, SOCK_DGRAM, 0);
     sockaddr_in addr{}; addr.sin_family = AF_INET; addr.sin_port = htons(opt.port); inet_pton(AF_INET, "127.0.0.1", &addr.sin_addr);
     int one = 1; setsockopt(sock, SOL_SOCKET, SO_REUSEADDR, &one, sizeof one);
     if (bind(sock, (sockaddr*)&addr, sizeof addr) != 0) { perror("bind"); return 1; }
 
-    sigset_t mask; sigemptyset(&mask);
-    for (int s : {SIGUSR2, SIGHUP, SIGTERM, SIGINT}) sigaddset(&mask, s);
-    sigprocmask(SIG_BLOCK, &mask, nullptr);
-    int sfd = signalfd(-1, &mask, SFD_CLOEXEC);
 
     // strength = how much of the head movement the sound stage follows (100 = exactly as you turn)
     FileValue strength(STRENGTH_FILE, 100.0, 0.0, 100.0), lookahead(LOOKAHEAD_FILE, 0.0, 0.0, 250.0);
@@ -271,8 +274,8 @@ int main(int argc, char** argv) {
                 switch (si.ssi_signo) {
                     case SIGHUP: haveQs = false; silent = true; centre(); break;
                     case SIGUSR2:
-                        if (access(FLAG.c_str(), F_OK) != 0) {            // switched off: fade to plain stereo (an audio envelope, so no click)
-                            for (int k = 1; k <= 6; ++k) { ParamList p; p.add("ambi:Mix", 1.0 - k / 6.0); push(p); usleep(25000); }
+                        if (access(FLAG.c_str(), F_OK) != 0) {            // switched off: glide to plain stereo (the filter stays in the path)
+                            { ParamList p; p.add("ambi:Mix", 0.0); push(p); usleep(250000); }   // the plugin glides to plain stereo over ~50 ms
                             pw.stop(); return 0;
                         }
                         break;

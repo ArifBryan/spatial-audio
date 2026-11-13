@@ -37,7 +37,7 @@ $(BUILD)/spatial: src/spatial.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) -o $@ $<
 
 $(BUILD)/spatial-tools: src/spatial-tools.cpp | $(BUILD)
-	$(CXX) $(CXXFLAGS) -o $@ $< -lmysofa
+	$(CXX) $(CXXFLAGS) -o $@ $< -lmysofa -ldl
 
 $(BUILD)/libspatial-dsp.so: src/dsp.cpp | $(BUILD)
 	$(CXX) $(CXXFLAGS) -O3 -shared -fPIC -o $@ $< -ldl
@@ -52,6 +52,7 @@ hrtf: $(BUILD)/spatial-tools $(BUILD)/libspatial-dsp.so
 	echo "$(HRTF_SHA)  data/downloads/D1_HRIR_SOFA.zip" | sha256sum -c -
 	unzip -oq data/downloads/D1_HRIR_SOFA.zip -d data/hrtf
 	$(BUILD)/spatial-tools gen-ambi
+	for i in 1 2 3; do $(BUILD)/spatial-tools calibrate; done
 
 # ---- tests
 TESTS := $(BUILD)/test-dsp $(BUILD)/test-gimbal

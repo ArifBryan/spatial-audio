@@ -1,6 +1,8 @@
 // spatial-tools: offline tool that builds the Ambisonics renderer's data from a SOFA HRTF set.
 //   spatial-tools gen-ambi [file.sofa]   fit the HRTF into order-3 spherical-harmonic channels and write
 //                                        data/ambi/ambi.bin and build/head-tracked-ambi.conf (the PipeWire filter graph)
+//   spatial-tools calibrate              closed loop: run the real plugin on centred and wide noise, measure the tone it produces per ear
+//                                        and fold the remaining difference from the input into data/ambi/ambi.bin (repeat 3 times)
 // Uses libmysofa (headers: libmysofa-dev). Any SOFA file with measured HRIRs works, so a personalised set is a drop-in.
 #include "sh.h"
 #include <mysofa.h>
@@ -11,6 +13,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <dlfcn.h>
 #include <fstream>
 #include <sstream>
 #include <string>
@@ -106,7 +109,7 @@ static void writeGraph() {
          "  { name = libpipewire-module-client-node }\n  { name = libpipewire-module-client-device }\n  { name = libpipewire-module-adapter }\n  { name = libpipewire-module-metadata }\n"
          "  { name = libpipewire-module-filter-chain\n    flags = [ nofail ]\n    args = {\n      node.description = \"Spatial Head-Tracked\"\n      media.name = \"Spatial Head-Tracked\"\n"
          "      filter.graph = {\n        nodes = [\n          { type = builtin label = copy name = cpL }\n          { type = builtin label = copy name = cpR }\n";
-    c << "          { type = ladspa name = ambi plugin = \"" << plugin << "\" label = ambirot control = { \"X 1\" = " << cos(PI / 6) << " \"Y 1\" = 0.5 \"Z 1\" = 0.0 \"X 2\" = " << cos(PI / 6) << " \"Y 2\" = -0.5 \"Z 2\" = 0.0 \"Mix\" = 1.0 } }\n";
+    c << "          { type = ladspa name = ambi plugin = \"" << plugin << "\" label = ambirot control = { \"X 1\" = " << cos(PI / 6) << " \"Y 1\" = 0.5 \"Z 1\" = 0.0 \"X 2\" = " << cos(PI / 6) << " \"Y 2\" = -0.5 \"Z 2\" = 0.0 \"Mix\" = 0.0 } }\n";
     c << "        ]\n        links = [\n          { output = \"cpL:Out\" input = \"ambi:In 1\" } { output = \"cpR:Out\" input = \"ambi:In 2\" }\n"
          "        ]\n        inputs  = [ \"cpL:In\" \"cpR:In\" ]\n        outputs = [ \"ambi:Out 1\" \"ambi:Out 2\" ]\n      }\n"
          "      capture.props = {\n        node.name = \"spatial_test_in\"\n        media.class = Audio/Sink\n        filter.smart = true\n        filter.smart.name = \"spatial-head-tracked\"\n"
@@ -207,9 +210,79 @@ static int cmdGenAmbi(const std::string& sofa) {
 
 // ------------------------------------------------------------------------------------------ bank export
 
+// ------------------------------------------------------------------------------------------ closed-loop calibration
+// The model behind gen-ambi's centre correction assumes how centred and wide music add at the ears. This measures instead: the
+// real plugin renders centred noise (same in both channels) and wide noise (independent channels) with the speakers at +-30
+// degrees, and each ear's average deviation from the input (in third-octave bands) is divided out of the filters.
+struct LadspaD {   // same layout as LADSPA_Descriptor
+    unsigned long id; const char* label; int props; const char *n, *m, *c; unsigned long pc; const int* pd; const char* const* pn; const void* ph; void* impl;
+    void* (*inst)(const LadspaD*, unsigned long); void (*conn)(void*, unsigned long, float*); void (*act)(void*); void (*run)(void*, unsigned long); void* ra; void* sg; void* de; void (*clean)(void*);
+};
+static const int NBAND = 24;                                   // third-octave centres 100 Hz .. 20 kHz
+// Target of the calibration relative to the input: flat, plus ONE smooth high shelf (+1.5 dB, centred near 5 kHz) that makes up for the
+// dullness of a spatialised sound. It is part of the fixed filters, so it applies equally at every head angle.
+static double airTarget(double f) { return 1.5 / (1.0 + pow(5000.0 / std::max(f, 1.0), 3.0)); }
+static double bandCentre(int i) { return 100.0 * pow(2.0, i / 3.0); }
+static void bandPowers(const std::vector<float>& x, double* out) {        // Welch average, 4096-point windows, power per third-octave band (dB)
+    const int W = 4096; std::vector<double> P(W / 2, 0.0); int cnt = 0;
+    for (size_t s0 = 48000; s0 + W <= x.size(); s0 += W / 2, ++cnt) {
+        std::vector<Cx> v(W); for (int i = 0; i < W; ++i) v[i] = x[s0 + i] * (0.5 - 0.5 * cos(2 * PI * i / W));
+        fft(v, false); for (int k = 0; k < W / 2; ++k) P[k] += std::norm(v[k]);
+    }
+    for (int b = 0; b < NBAND; ++b) {
+        double lo = bandCentre(b) / pow(2.0, 1.0 / 6.0), hi = bandCentre(b) * pow(2.0, 1.0 / 6.0), sum = 0; int n = 0;
+        for (int k = 0; k < W / 2; ++k) { double f = k * SR / W; if (f >= lo && f < hi) { sum += P[k]; ++n; } }
+        out[b] = 10 * log10(sum / std::max(n, 1) / std::max(cnt, 1) + 1e-20);
+    }
+}
+static int cmdCalibrate() {
+    const std::string so = HERE + "/libspatial-dsp.so", bin = DATA + "/ambi/ambi.bin";
+    void* lib = dlopen(so.c_str(), RTLD_NOW); if (!lib) { fprintf(stderr, "cannot load %s\n", so.c_str()); return 1; }
+    auto desc = (const LadspaD* (*)(unsigned long))dlsym(lib, "ladspa_descriptor"); const LadspaD* d = desc ? desc(0) : nullptr; if (!d) return 1;
+    // measure both cases
+    const int N = 48000 * 8; double dev[2][2][NBAND];                // [case][ear][band]
+    for (int cs = 0; cs < 2; ++cs) {
+        void* hd = d->inst(d, 48000); float c[7] = {(float)cos(PI / 6), 0.5f, 0.f, (float)cos(PI / 6), -0.5f, 0.f, 1.f};
+        for (int k = 0; k < 7; ++k) d->conn(hd, 4 + k, &c[k]);
+        if (d->act) d->act(hd);
+        std::vector<float> in[2], out[2]; for (int e = 0; e < 2; ++e) { in[e].assign(N, 0.f); out[e].assign(N, 0.f); }
+        unsigned long long st = 88172645463325252ULL; auto rnd = [&]() { st ^= st << 13; st ^= st >> 7; st ^= st << 17; return (float)((st >> 11) * (1.0 / 9007199254740992.0) - 0.5); };
+        for (int i = 0; i < N; ++i) { float a = rnd() * 0.3f, b = rnd() * 0.3f; in[0][i] = a; in[1][i] = cs ? b : a; }
+        for (int p = 0; p < N; p += 64) { for (int e = 0; e < 2; ++e) { d->conn(hd, e, in[e].data() + p); d->conn(hd, 2 + e, out[e].data() + p); } d->run(hd, 64); }
+        double bi[NBAND], bo[2][NBAND]; bandPowers(in[0], bi); bandPowers(out[0], bo[0]); bandPowers(out[1], bo[1]);
+        for (int e = 0; e < 2; ++e) for (int b = 0; b < NBAND; ++b) dev[cs][e][b] = bo[e][b] - bi[b];
+        if (d->clean) d->clean(hd);
+    }
+    // read the filter file
+    FILE* f = fopen(bin.c_str(), "rb"); if (!f) { fprintf(stderr, "run gen-ambi first\n"); return 1; }
+    char magic[8]; uint32_t hdr[2]; if (fread(magic, 1, 8, f) != 8 || fread(hdr, 4, 2, f) != 2) return 1;
+    const int C = (int)hdr[0], T = (int)hdr[1]; std::vector<float> itd(C), h((size_t)C * 2 * T);
+    if (fread(itd.data(), 4, itd.size(), f) != itd.size() || fread(h.data(), 4, h.size(), f) != h.size()) return 1;
+    fclose(f);
+    // correction per ear: minus the mean of the two cases, smoothed over three bands, damped, limited
+    double worstBefore = 0, g[2][NBAND];
+    for (int e = 0; e < 2; ++e) {
+        double m[NBAND]; for (int b = 0; b < NBAND; ++b) { m[b] = 0.5 * (dev[0][e][b] + dev[1][e][b]) - airTarget(bandCentre(b)); worstBefore = std::max(worstBefore, fabs(dev[0][e][b])); worstBefore = std::max(worstBefore, fabs(dev[1][e][b])); }
+        for (int b = 0; b < NBAND; ++b) { double acc = 0; int n = 0; for (int j = std::max(0, b - 1); j <= std::min(NBAND - 1, b + 1); ++j) { acc += m[j]; ++n; } g[e][b] = std::min(6.0, std::max(-6.0, -0.8 * acc / n)); }
+    }
+    const size_t FFT = 1024;
+    for (int c = 0; c < C; ++c) for (int e = 0; e < 2; ++e) {
+        std::vector<Cx> X(FFT, 0.0); for (int i = 0; i < T; ++i) X[i] = h[((size_t)c * 2 + e) * T + i]; fft(X, false);
+        for (size_t k = 0; k < FFT; ++k) {
+            double fr = (k <= FFT / 2 ? k : FFT - k) * SR / FFT, pos = std::min((double)NBAND - 1, std::max(0.0, 3.0 * log2(std::max(fr, 100.0) / 100.0)));
+            int i0 = std::min(NBAND - 2, (int)pos); double u = pos - i0, db = g[e][i0] * (1 - u) + g[e][i0 + 1] * u; X[k] *= pow(10.0, db / 20.0);
+        }
+        fft(X, true); for (int i = 0; i < T; ++i) { double v = X[i].real(); if (i >= T - 24) v *= 0.5 * (1 + cos(PI * (i - (T - 24)) / 24)); h[((size_t)c * 2 + e) * T + i] = (float)v; }
+    }
+    f = fopen(bin.c_str(), "wb"); fwrite("SPAM1\0\0\0", 1, 8, f); fwrite(hdr, 4, 2, f); fwrite(itd.data(), 4, itd.size(), f); fwrite(h.data(), 4, h.size(), f); fclose(f);
+    printf("calibrate: worst deviation from the input before this pass %.1f dB (centred or wide, either ear)\n", worstBefore);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     char buf[4096]; ssize_t n = readlink("/proc/self/exe", buf, sizeof buf - 1); buf[n > 0 ? n : 0] = 0; HERE = buf; HERE = HERE.substr(0, HERE.rfind('/')); ROOT = HERE + "/.."; DATA = ROOT + "/data";
-    if (argc < 2 || std::string(argv[1]) != "gen-ambi") { fprintf(stderr, "usage: spatial-tools gen-ambi [file.sofa]\n"); return 2; }
+    if (argc >= 2 && std::string(argv[1]) == "calibrate") return cmdCalibrate();
+    if (argc < 2 || std::string(argv[1]) != "gen-ambi") { fprintf(stderr, "usage: spatial-tools gen-ambi [file.sofa] | calibrate\n"); return 2; }
     std::string sofa = argc > 2 ? argv[2] : DATA + "/hrtf/D1_HRIR_SOFA/D1_48K_24bit_256tap_FIR_SOFA.sofa";     // SADIE II KU100, see `make hrtf`
     return cmdGenAmbi(sofa);
 }

@@ -347,15 +347,17 @@ struct Daemon {
             }
             if (enabled) pw.start({"pipewire", "-c", conf});
             NodeInfo* f = byName("spatial_test_in");
-            if (!enabled && pw.running() && (!f || f->state != "running")) { pw.stop(); f = nullptr; }   // off and idle: remove the filter now
+            // Off: while audio is playing the filter stays in the path as a plain-stereo passthrough (moving a playing stream can interrupt it);
+            // as soon as nothing is playing it is removed, and streams are re-linked to the earbuds while silent.
+            if (!enabled && pw.running() && (!f || f->state != "running")) { pw.stop(); f = nullptr; }
             if (f) { pinVolume(f); orderFilters(); }
             if (enabled && f) {
                 ht.start({HERE + "/head-track", "--node", std::to_string(f->id)});
                 std::string sensor = sensorNode();
                 if (!sensor.empty()) tr.start({ROOT + "/third_party/SonyTrackerLinux/sony-tracker", "-d", sensor}); else { tr.stop(); askForSensorProfile(); }
             } else if (!enabled) {
-                if (ht.running()) ht.signal(SIGUSR2);                    // helper fades out, goes to plain stereo, exits -> we run again
-                else tr.stop();
+                if (ht.running()) ht.signal(SIGUSR2);                    // helper glides to plain stereo and exits -> we run again
+                else tr.stop();                                          // the filter goes once playback stops (above)
             }
         }
         writeState(compat, enabled);

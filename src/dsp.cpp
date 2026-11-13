@@ -9,6 +9,9 @@
 // The direction arrives as a unit vector (x forward, y left, z up). Angles are never used, so straight up/down is not special.
 // A block limiter keeps the output below full scale: turning towards a speaker raises the level at the near ear.
 //
+// With Mix at 0 (and faded out) the plugin copies its input and does no rendering, so the filter can stay in the stream path
+// permanently: switching the effect on and off never moves a stream. "Mix" changes glide over about 50 ms.
+//
 // Ports: 0 "In 1" 1 "In 2" (left/right channel = speaker 1/2)   2 "Out 1" 3 "Out 2" (left/right ear)
 //        4..6 "X 1" "Y 1" "Z 1" (speaker 1 direction)   7..9 "X 2" "Y 2" "Z 2"   10 "Mix" (0 = plain stereo, 1 = rendered)
 // Data: <plugin folder>/../data/ambi/ambi.bin
@@ -86,9 +89,9 @@ AmbiData& ambiData() {
 }
 
 struct Ambi {
-    double rate = 48000.0; bool primed = false; AmbiData* data = nullptr; int T = 0;
+    double rate = 48000.0; bool primed = false, idle = true; AmbiData* data = nullptr; int T = 0;
     const float *in[2] = {nullptr, nullptr}, *ctl[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}; float* out[2] = {nullptr, nullptr};
-    double y[2][SH_CHANNELS], curDelay[2][2] = {{0, 0}, {0, 0}}, mix = 1.0, gain = 1.0;   // encoding gains per speaker; smoothed delays [speaker][ear]; stereo/rendered mix; limiter gain
+    double y[2][SH_CHANNELS], curDelay[2][2] = {{0, 0}, {0, 0}}, mix = 0.0, gain = 1.0;   // encoding gains per speaker; smoothed delays [speaker][ear]; stereo/rendered mix; limiter gain
     std::vector<float> ring[2], hist[2][SH_CHANNELS], hr[SH_CHANNELS][2];              // delay rings per speaker; encoded history [ear][channel]; reversed filters
     unsigned pos = 0;
 };
@@ -116,13 +119,24 @@ void ambiRun(LADSPA_Handle hd, unsigned long n) {
     const double dl = 1.0 - std::exp(-1.0 / (0.015 * a->rate)), release = 1.0 - std::exp(-(double)RB / (0.15 * a->rate));
     for (unsigned long b0 = 0; b0 < n; b0 += RB) {
         const int b = (int)std::min<unsigned long>(RB, n - b0); double yt[2][SH_CHANNELS], tgt[2][2];
+        const double mixT = std::min(1.0, std::max(0.0, (double)*a->ctl[6]));
+        double mixN = a->mix + (mixT - a->mix) * (1.0 - std::exp(-(double)b / (0.05 * a->rate))); if (std::fabs(mixT - mixN) < 1e-3) mixN = mixT;
+        if (mixT == 0.0 && mixN == 0.0) {                                                   // effect off: plain stereo, no rendering
+            for (int e = 0; e < 2; ++e) std::copy(a->in[e] + b0, a->in[e] + b0 + b, a->out[e] + b0);
+            a->mix = 0.0; a->gain = 1.0; a->idle = true; continue;
+        }
+        if (a->idle) {                                                                      // effect coming on: start from a clean state
+            for (int s = 0; s < 2; ++s) std::fill(a->ring[s].begin(), a->ring[s].end(), 0.f);
+            for (int e = 0; e < 2; ++e) for (int c = 0; c < SH_CHANNELS; ++c) std::fill(a->hist[e][c].begin(), a->hist[e][c].end(), 0.f);
+            a->primed = false; a->idle = false;
+        }
         for (int s = 0; s < 2; ++s) {
             double x, yy, z; direction(&a->ctl[3 * s], &x, &yy, &z);
             shEval(x, yy, z, yt[s]);
             double itd = 0; for (int c = 0; c < SH_CHANNELS; ++c) itd += a->data->itd[c] * yt[s][c];
             tgt[s][0] = std::fmax(0.0, -itd) * a->rate; tgt[s][1] = std::fmax(0.0, itd) * a->rate;
         }
-        if (!a->primed) { for (int s = 0; s < 2; ++s) { for (int c = 0; c < SH_CHANNELS; ++c) a->y[s][c] = yt[s][c]; for (int e = 0; e < 2; ++e) a->curDelay[s][e] = tgt[s][e]; } a->mix = std::min(1.0, std::max(0.0, (double)*a->ctl[6])); a->primed = true; }
+        if (!a->primed) { for (int s = 0; s < 2; ++s) { for (int c = 0; c < SH_CHANNELS; ++c) a->y[s][c] = yt[s][c]; for (int e = 0; e < 2; ++e) a->curDelay[s][e] = tgt[s][e]; } a->primed = true; }
         double step[2][SH_CHANNELS]; for (int s = 0; s < 2; ++s) for (int c = 0; c < SH_CHANNELS; ++c) step[s][c] = (yt[s][c] - a->y[s][c]) / b;    // linear ramp over the block: continuous encoding
         for (int i = 0; i < b; ++i) {
             double xd[2][2];
@@ -145,10 +159,10 @@ void ambiRun(LADSPA_Handle hd, unsigned long n) {
             for (int c = 0; c < SH_CHANNELS; ++c) acc += dotf(a->hr[c][e].data(), &a->hist[e][c][i], T);
             o[e][i] = acc;                                                                  // fixed filters: sum of the filtered channels
         }
-        const double mixTo = std::min(1.0, std::max(0.0, (double)*a->ctl[6])), mixStep = (mixTo - a->mix) / b;
-        if (mixStep != 0.0 || a->mix < 1.0)                                                 // fade to / from plain stereo
+        const double mixStep = (mixN - a->mix) / b;
+        if (mixStep != 0.0 || mixN < 1.0)                                                   // fade to / from plain stereo
             for (int i = 0; i < b; ++i) { double m = a->mix + mixStep * (i + 1); for (int e = 0; e < 2; ++e) o[e][i] = (float)(m * o[e][i] + (1.0 - m) * a->in[e][b0 + i]); }
-        a->mix = mixTo;
+        a->mix = mixN;
         float peak = 0; for (int e = 0; e < 2; ++e) for (int i = 0; i < b; ++i) peak = std::max(peak, std::fabs(o[e][i]));
         double want = peak > CEILING ? CEILING / peak : 1.0, to = std::min(want, a->gain + (1.0 - a->gain) * release);   // down at once, back up slowly
         const int ramp = to < a->gain ? std::min(b, 16) : b; const double gs = (to - a->gain) / ramp;
