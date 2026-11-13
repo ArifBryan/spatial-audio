@@ -184,6 +184,17 @@ static Quat slerp(Quat a, Quat b, double t) {
     return Quat{wa * a.w + wb * b.w, wa * a.x + wb * b.x, wa * a.y + wb * b.y, wa * a.z + wb * b.z}.norm();
 }
 
+// Strength < 100: the sound stage follows only a share of the head rotation. Scaling a rotation is not continuous all the way
+// round (at 180 degrees the axis flips sign), so the share fades to 100 % over the last 90 degrees before 180: the stage
+// follows exactly when you are facing backwards, and there is no seam there.
+static Quat scaleRotation(Quat q, double share) {
+    if (q.w < 0) q = {-q.w, -q.x, -q.y, -q.z};
+    double s = std::sqrt(q.x * q.x + q.y * q.y + q.z * q.z); if (s < 1e-9 || share >= 1.0) return q;
+    double theta = 2 * std::atan2(s, q.w), u = std::min(1.0, std::max(0.0, (theta - rad(90.0)) / rad(90.0))), f = u * u * (3 - 2 * u);
+    double t2 = theta * (share + (1.0 - share) * f), h = t2 / 2, k = std::sin(h) / s;
+    return Quat{std::cos(h), q.x * k, q.y * k, q.z * k};
+}
+
 // ------------------------------------------------------------------------------------------ look-ahead (on the rotation)
 struct Predictor {
     double lookahead = 0, maxLeadDeg = 15, deadbandDps = 4, tau = 0.12, prevT = 0; Vec w{0, 0, 0}; Quat prev; bool have = false;
@@ -284,8 +295,7 @@ int main(int argc, char** argv) {
         pred.lookahead = lookahead.get() / 1000.0;
         Quat aim = pred.update(qs, now);
         if (aim.w < 0) aim = {-aim.w, -aim.x, -aim.y, -aim.z};
-        aim = slerp(Quat(), aim, strength.get() / 100.0);
-        if (aim.w < 0) aim = {-aim.w, -aim.x, -aim.y, -aim.z};
+        aim = scaleRotation(aim, strength.get() / 100.0);
 
         double cur[4] = {std::round(aim.w * 500) / 500, std::round(aim.x * 500) / 500, std::round(aim.y * 500) / 500, std::round(aim.z * 500) / 500};
         if (haveLast && !memcmp(cur, last, sizeof cur)) continue;                  // nothing audible changed

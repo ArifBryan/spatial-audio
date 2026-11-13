@@ -25,5 +25,16 @@ int main() {
     }
     bool ok = worstStep < trueStep * 1.5 + 0.5 && worstErr < 4.0;
     printf("looking down past vertical: %s  largest step %.1f deg (real head: %.1f), largest position error %.1f deg\n", ok ? "ok  " : "FAIL", worstStep, trueStep, worstErr);
-    return ok ? 0 : 1;
+    // Reduced strength: the speakers must not jump when the head passes 180 degrees (backwards), at any strength.
+    bool ok2 = true; double worst2 = 0;
+    for (double share : {1.0, 0.7, 0.5, 0.2, 0.0}) {
+        Vec pv{}; double w = 0;
+        for (double yaw = 100; yaw <= 260; yaw += 0.5) {
+            Quat q = scaleRotation(Quat::fromMat(headMatrix(wrap(yaw), 0, 0)), share); Vec v = q.rotate(speakerDir(0));
+            if (yaw > 100) w = std::max(w, angleBetween(v, pv)); pv = v;
+        }
+        worst2 = std::max(worst2, w); if (w > 3.0) ok2 = false;   // the stage speeds up towards the back to catch up; a seam would be 100+ degrees
+    }
+    printf("rotation scaling through 180 degrees: %s  largest step %.2f deg per 0.5 deg of head turn\n", ok2 ? "ok  " : "FAIL", worst2);
+    return ok && ok2 ? 0 : 1;
 }
