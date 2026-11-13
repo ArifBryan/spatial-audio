@@ -1,19 +1,23 @@
 // libspatial-dsp.so: the Ambisonics renderer used by the spatial-audio filter graph (a LADSPA plugin for PipeWire's filter-chain).
 //
 // ambirot, order 3 (16 channels). The HRTF was fitted into spherical-harmonic channels offline (`spatial-tools gen-ambi`),
-// so the filters are FIXED. At runtime each virtual speaker is encoded at its current direction in the head's frame (the head
+// so the filters are FIXED. At runtime every virtual speaker is encoded at its current direction in the head's frame (the head
 // rotation is simply where the speaker is in that frame) and the channels are filtered with the fixed filters. Moving the
 // head changes smooth encoding gains only: nothing is switched or interpolated between measurements. The interaural time
 // difference is fitted in the same basis and applied with a smooth fractional delay per ear.
 //
-// The direction arrives as a unit vector (x forward, y left, z up). Angles are never used, so straight up/down is not special.
+// Surround: eight inputs in PipeWire's 7.1 order, FL FR FC LFE RL RR SL SR, each a virtual speaker in the room (FL/FR +-30,
+// FC 0, SL/SR +-90, RL/RR +-135 degrees; centre and surrounds at -3 dB like a standard downmix; LFE to both ears). Stereo
+// content only uses FL and FR. A speaker whose input has been silent is skipped, so stereo costs what it always did.
+//
+// The head rotation arrives as a quaternion, so no angles are ever used and straight up/down is not special.
 // A block limiter keeps the output below full scale: turning towards a speaker raises the level at the near ear.
 //
-// With Mix at 0 (and faded out) the plugin copies its input and does no rendering, so the filter can stay in the stream path
-// permanently: switching the effect on and off never moves a stream. "Mix" changes glide over about 50 ms.
+// With Mix at 0 (and faded out) the plugin outputs a plain stereo downmix of its input and does no rendering, so the filter can
+// stay in the stream path while audio plays: switching the effect on and off never moves a stream. "Mix" glides over about 50 ms.
 //
-// Ports: 0 "In 1" 1 "In 2" (left/right channel = speaker 1/2)   2 "Out 1" 3 "Out 2" (left/right ear)
-//        4..6 "X 1" "Y 1" "Z 1" (speaker 1 direction)   7..9 "X 2" "Y 2" "Z 2"   10 "Mix" (0 = plain stereo, 1 = rendered)
+// Ports: 0..7 "In FL" "In FR" "In FC" "In LFE" "In RL" "In RR" "In SL" "In SR"   8 "Out L" 9 "Out R" (the ears)
+//        10..13 "Q W" "Q X" "Q Y" "Q Z" (head rotation)   14 "Mix" (0 = plain stereo, 1 = rendered)
 // Data: <plugin folder>/../data/ambi/ambi.bin
 #if __has_include(<ladspa.h>)
 #include <ladspa.h>
@@ -58,6 +62,19 @@ struct LADSPA_Descriptor {
 
 #include "sh.h"
 
+
+#include <dlfcn.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cstdint>
+#include <cstdio>
+#include <cstring>
+#include <string>
+#include <vector>
+
+#include "sh.h"
+
 namespace {
 // Dot product of two float arrays: eight independent accumulators let the compiler vectorise it; a wider (AVX2/FMA) version
 // is picked at run time where the CPU has it. This is the hot loop of the renderer.
@@ -72,6 +89,12 @@ __attribute__((target_clones("avx2,fma", "default"))) float dotf(const float* a,
 
 constexpr int RB = 64, RING = 1 << 13;                // processing block (1.3 ms at 48 kHz); delay ring (170 ms, ample for the time difference)
 constexpr float CEILING = 0.95f;                      // the limiter keeps peaks under this
+constexpr int NIN = 8, NSPK = 7, LFE = 3;             // input channels; spatial speakers (all but the LFE)
+constexpr int SPK_IN[NSPK] = {0, 1, 2, 4, 5, 6, 7};   // input channel of each spatial speaker: FL FR FC RL RR SL SR
+constexpr double SPK_AZ[NSPK] = {30, -30, 0, 135, -135, 90, -90};                       // degrees, + = left
+constexpr double SPK_GAIN[NSPK] = {1, 1, 0.70710678, 0.70710678, 0.70710678, 0.70710678, 0.70710678};
+constexpr double LFE_GAIN = 0.5;
+constexpr int QUIET = 192;                            // samples of silence after which a speaker is skipped (longer than its delay line's reach)
 
 struct AmbiData { uint32_t C = 0, T = 0; std::vector<float> itd, h; };            // h[(c*2+ear)*T + n], stored in file order
 AmbiData& ambiData() {
@@ -90,14 +113,15 @@ AmbiData& ambiData() {
 
 struct Ambi {
     double rate = 48000.0; bool primed = false, idle = true; AmbiData* data = nullptr; int T = 0;
-    const float *in[2] = {nullptr, nullptr}, *ctl[7] = {nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr}; float* out[2] = {nullptr, nullptr};
-    double y[2][SH_CHANNELS], curDelay[2][2] = {{0, 0}, {0, 0}}, mix = 0.0, gain = 1.0;   // encoding gains per speaker; smoothed delays [speaker][ear]; stereo/rendered mix; limiter gain
-    std::vector<float> ring[2], hist[2][SH_CHANNELS], hr[SH_CHANNELS][2];              // delay rings per speaker; encoded history [ear][channel]; reversed filters
+    const float* in[NIN] = {}; const float* ctl[5] = {}; float* out[2] = {nullptr, nullptr};
+    double y[NSPK][SH_CHANNELS], curDelay[NSPK][2] = {}, mix = 0.0, gain = 1.0;         // encoding gains per speaker; smoothed delays [speaker][ear]; stereo/rendered mix; limiter gain
+    int quiet[NSPK] = {};                                                               // samples since each speaker last had signal
+    std::vector<float> ring[NSPK], hist[2][SH_CHANNELS], hr[SH_CHANNELS][2];           // delay rings per speaker; encoded history [ear][channel]; reversed filters
     unsigned pos = 0;
 };
 LADSPA_Handle ambiInstantiate(const LADSPA_Descriptor*, unsigned long rate) {
     auto* a = new Ambi; a->rate = (double)rate; a->data = &ambiData(); a->T = (int)a->data->T;
-    for (int s = 0; s < 2; ++s) a->ring[s].assign(RING, 0.f);
+    for (int s = 0; s < NSPK; ++s) { a->ring[s].assign(RING, 0.f); a->quiet[s] = 1 << 30; }
     for (int c = 0; c < SH_CHANNELS; ++c) for (int e = 0; e < 2; ++e) {
         a->hist[e][c].assign(a->T + RB, 0.f); a->hr[c][e].assign(a->T, 0.f);
         if (a->data->C) for (int k = 0; k < a->T; ++k) a->hr[c][e][a->T - 1 - k] = a->data->h[((size_t)c * 2 + e) * a->T + k];     // reversed once
@@ -106,62 +130,85 @@ LADSPA_Handle ambiInstantiate(const LADSPA_Descriptor*, unsigned long rate) {
 }
 void ambiConnect(LADSPA_Handle h, unsigned long port, LADSPA_Data* p) {
     auto* a = (Ambi*)h;
-    if (port < 2) a->in[port] = p; else if (port < 4) a->out[port - 2] = p; else a->ctl[port - 4] = p;
+    if (port < NIN) a->in[port] = p; else if (port < NIN + 2) a->out[port - NIN] = p; else a->ctl[port - NIN - 2] = p;
 }
-// Unit direction from the three control values (a degenerate vector falls back to straight ahead).
-void direction(const float* const* c, double* x, double* y, double* z) {
-    double a = *c[0], b = *c[1], d = *c[2], n = std::sqrt(a * a + b * b + d * d);
-    if (n < 1e-6) { *x = 1; *y = 0; *z = 0; } else { *x = a / n; *y = b / n; *z = d / n; }
+// Direction of speaker s in the head's frame: the world direction rotated by the head quaternion (identity if it is degenerate).
+void headFrame(const double q[4], int s, double* x, double* y, double* z) {
+    double w = q[0], qx = q[1], qy = q[2], qz = q[3], n = std::sqrt(w * w + qx * qx + qy * qy + qz * qz);
+    if (n < 1e-6) { w = 1; qx = qy = qz = 0; n = 1; }
+    w /= n; qx /= n; qy /= n; qz /= n;
+    double az = SPK_AZ[s] * M_PI / 180, vx = std::cos(az), vy = std::sin(az);
+    double tx = 2 * (qy * 0 - qz * vy), ty = 2 * (qz * vx - qx * 0), tz = 2 * (qx * vy - qy * vx);          // t = 2 * (q.xyz x v), v = (vx, vy, 0)
+    *x = vx + w * tx + (qy * tz - qz * ty); *y = vy + w * ty + (qz * tx - qx * tz); *z = 0 + w * tz + (qx * ty - qy * tx);
 }
 void ambiRun(LADSPA_Handle hd, unsigned long n) {
     auto* a = (Ambi*)hd; const int T = a->T;
-    if (!a->data || a->data->C == 0 || T == 0) { for (int e = 0; e < 2; ++e) std::copy(a->in[e], a->in[e] + n, a->out[e]); return; }   // no data: plain stereo
+    auto dry = [&](int e, unsigned long i) {                                              // plain stereo downmix (stereo input passes unchanged)
+        const int d = e == 0 ? 4 : 5, side = e == 0 ? 6 : 7;
+        return (double)a->in[e][i] + 0.70710678 * ((double)a->in[2][i] + a->in[d][i] + a->in[side][i]) + LFE_GAIN * a->in[LFE][i];
+    };
+    if (!a->data || a->data->C == 0 || T == 0) { for (int e = 0; e < 2; ++e) for (unsigned long i = 0; i < n; ++i) a->out[e][i] = (float)dry(e, i); return; }   // no data: plain stereo
     const double dl = 1.0 - std::exp(-1.0 / (0.015 * a->rate)), release = 1.0 - std::exp(-(double)RB / (0.15 * a->rate));
     for (unsigned long b0 = 0; b0 < n; b0 += RB) {
-        const int b = (int)std::min<unsigned long>(RB, n - b0); double yt[2][SH_CHANNELS], tgt[2][2];
-        const double mixT = std::min(1.0, std::max(0.0, (double)*a->ctl[6]));
+        const int b = (int)std::min<unsigned long>(RB, n - b0); double yt[NSPK][SH_CHANNELS], tgt[NSPK][2];
+        const double mixT = std::min(1.0, std::max(0.0, (double)*a->ctl[4]));
         double mixN = a->mix + (mixT - a->mix) * (1.0 - std::exp(-(double)b / (0.05 * a->rate))); if (std::fabs(mixT - mixN) < 1e-3) mixN = mixT;
         if (mixT == 0.0 && mixN == 0.0) {                                                   // effect off: plain stereo, no rendering
-            for (int e = 0; e < 2; ++e) std::copy(a->in[e] + b0, a->in[e] + b0 + b, a->out[e] + b0);
+            for (int e = 0; e < 2; ++e) for (int i = 0; i < b; ++i) a->out[e][b0 + i] = (float)dry(e, b0 + i);
             a->mix = 0.0; a->gain = 1.0; a->idle = true; continue;
         }
         if (a->idle) {                                                                      // effect coming on: start from a clean state
-            for (int s = 0; s < 2; ++s) std::fill(a->ring[s].begin(), a->ring[s].end(), 0.f);
+            for (int s = 0; s < NSPK; ++s) { std::fill(a->ring[s].begin(), a->ring[s].end(), 0.f); a->quiet[s] = 1 << 30; }
             for (int e = 0; e < 2; ++e) for (int c = 0; c < SH_CHANNELS; ++c) std::fill(a->hist[e][c].begin(), a->hist[e][c].end(), 0.f);
             a->primed = false; a->idle = false;
         }
-        for (int s = 0; s < 2; ++s) {
-            double x, yy, z; direction(&a->ctl[3 * s], &x, &yy, &z);
+        double q[4] = {*a->ctl[0], *a->ctl[1], *a->ctl[2], *a->ctl[3]};
+        for (int s = 0; s < NSPK; ++s) {
+            double x, yy, z; headFrame(q, s, &x, &yy, &z);
             shEval(x, yy, z, yt[s]);
             double itd = 0; for (int c = 0; c < SH_CHANNELS; ++c) itd += a->data->itd[c] * yt[s][c];
             tgt[s][0] = std::fmax(0.0, -itd) * a->rate; tgt[s][1] = std::fmax(0.0, itd) * a->rate;
         }
-        if (!a->primed) { for (int s = 0; s < 2; ++s) { for (int c = 0; c < SH_CHANNELS; ++c) a->y[s][c] = yt[s][c]; for (int e = 0; e < 2; ++e) a->curDelay[s][e] = tgt[s][e]; } a->primed = true; }
-        double step[2][SH_CHANNELS]; for (int s = 0; s < 2; ++s) for (int c = 0; c < SH_CHANNELS; ++c) step[s][c] = (yt[s][c] - a->y[s][c]) / b;    // linear ramp over the block: continuous encoding
+        bool act[NSPK];
+        for (int s = 0; s < NSPK; ++s) {                                                    // which speakers carry signal
+            const float* x = a->in[SPK_IN[s]] + b0; bool any = false; for (int i = 0; i < b && !any; ++i) any = x[i] != 0.f;
+            a->quiet[s] = any ? 0 : (a->quiet[s] > (1 << 29) ? a->quiet[s] : a->quiet[s] + b);
+            act[s] = a->quiet[s] < QUIET;
+        }
+        for (int s = 0; s < NSPK; ++s) if (!act[s] || !a->primed) {                         // nothing to hear: just follow the target, no smoothing needed
+            for (int c = 0; c < SH_CHANNELS; ++c) a->y[s][c] = yt[s][c];
+            for (int e = 0; e < 2; ++e) a->curDelay[s][e] = tgt[s][e];
+        }
+        a->primed = true;
+        double step[NSPK][SH_CHANNELS]; for (int s = 0; s < NSPK; ++s) for (int c = 0; c < SH_CHANNELS; ++c) step[s][c] = (yt[s][c] - a->y[s][c]) / b;    // linear ramp over the block: continuous encoding
         for (int i = 0; i < b; ++i) {
-            double xd[2][2];
-            for (int s = 0; s < 2; ++s) {
-                a->ring[s][(a->pos + i) & (RING - 1)] = a->in[s][b0 + i];
+            double xd[NSPK][2];
+            for (int s = 0; s < NSPK; ++s) {
+                a->ring[s][(a->pos + i) & (RING - 1)] = a->in[SPK_IN[s]][b0 + i];
+                if (!act[s]) continue;
                 for (int e = 0; e < 2; ++e) {
                     a->curDelay[s][e] += dl * (tgt[s][e] - a->curDelay[s][e]);
                     double rd = (double)(a->pos + i) - (a->curDelay[s][e] + 2.0), fl = std::floor(rd), t = rd - fl; long k = (long)fl; const std::vector<float>& R = a->ring[s];
                     float y0 = R[(k - 1) & (RING - 1)], y1 = R[k & (RING - 1)], y2 = R[(k + 1) & (RING - 1)], y3 = R[(k + 2) & (RING - 1)];
                     double c1 = 0.5 * (y2 - y0), c2 = y0 - 2.5 * y1 + 2.0 * y2 - 0.5 * y3, c3 = 0.5 * (y3 - y0) + 1.5 * (y1 - y2);
-                    xd[s][e] = ((c3 * t + c2) * t + c1) * t + y1;
+                    xd[s][e] = (((c3 * t + c2) * t + c1) * t + y1) * SPK_GAIN[s];
                 }
+                for (int c = 0; c < SH_CHANNELS; ++c) a->y[s][c] += step[s][c];
             }
-            for (int s = 0; s < 2; ++s) for (int c = 0; c < SH_CHANNELS; ++c) a->y[s][c] += step[s][c];
-            for (int e = 0; e < 2; ++e) for (int c = 0; c < SH_CHANNELS; ++c) a->hist[e][c][T - 1 + i] = (float)(a->y[0][c] * xd[0][e] + a->y[1][c] * xd[1][e]);   // encode
+            for (int e = 0; e < 2; ++e) for (int c = 0; c < SH_CHANNELS; ++c) {
+                double v = 0; for (int s = 0; s < NSPK; ++s) if (act[s]) v += a->y[s][c] * xd[s][e];
+                a->hist[e][c][T - 1 + i] = (float)v;                                        // encode
+            }
         }
         float* o[2] = {a->out[0] + b0, a->out[1] + b0};
         for (int e = 0; e < 2; ++e) for (int i = 0; i < b; ++i) {
             float acc = 0;
             for (int c = 0; c < SH_CHANNELS; ++c) acc += dotf(a->hr[c][e].data(), &a->hist[e][c][i], T);
-            o[e][i] = acc;                                                                  // fixed filters: sum of the filtered channels
+            o[e][i] = acc + (float)(LFE_GAIN * a->in[LFE][b0 + i]);                        // fixed filters: sum of the filtered channels; the LFE goes to both ears as it is
         }
         const double mixStep = (mixN - a->mix) / b;
         if (mixStep != 0.0 || mixN < 1.0)                                                   // fade to / from plain stereo
-            for (int i = 0; i < b; ++i) { double m = a->mix + mixStep * (i + 1); for (int e = 0; e < 2; ++e) o[e][i] = (float)(m * o[e][i] + (1.0 - m) * a->in[e][b0 + i]); }
+            for (int i = 0; i < b; ++i) { double m = a->mix + mixStep * (i + 1); for (int e = 0; e < 2; ++e) o[e][i] = (float)(m * o[e][i] + (1.0 - m) * dry(e, b0 + i)); }
         a->mix = mixN;
         float peak = 0; for (int e = 0; e < 2; ++e) for (int i = 0; i < b; ++i) peak = std::max(peak, std::fabs(o[e][i]));
         double want = peak > CEILING ? CEILING / peak : 1.0, to = std::min(want, a->gain + (1.0 - a->gain) * release);   // down at once, back up slowly
@@ -177,18 +224,19 @@ void ambiRun(LADSPA_Handle hd, unsigned long n) {
 }
 void ambiCleanup(LADSPA_Handle h) { delete (Ambi*)h; }
 
-LADSPA_PortDescriptor kPorts[11]; LADSPA_PortRangeHint kHints[11]; LADSPA_Descriptor kDescriptor;
-const char* const kNames[11] = {"In 1", "In 2", "Out 1", "Out 2", "X 1", "Y 1", "Z 1", "X 2", "Y 2", "Z 2", "Mix"};
+constexpr int NPORT = NIN + 2 + 5;
+LADSPA_PortDescriptor kPorts[NPORT]; LADSPA_PortRangeHint kHints[NPORT]; LADSPA_Descriptor kDescriptor;
+const char* const kNames[NPORT] = {"In FL", "In FR", "In FC", "In LFE", "In RL", "In RR", "In SL", "In SR", "Out L", "Out R", "Q W", "Q X", "Q Y", "Q Z", "Mix"};
 const LADSPA_Descriptor* descriptor() {
     static bool init = false;
     if (!init) {
-        for (int i = 0; i < 11; ++i) {
-            kPorts[i] = i < 2 ? (LADSPA_PORT_INPUT | LADSPA_PORT_AUDIO) : i < 4 ? (LADSPA_PORT_OUTPUT | LADSPA_PORT_AUDIO) : (LADSPA_PORT_INPUT | LADSPA_PORT_CONTROL);
-            kHints[i] = i < 4 ? LADSPA_PortRangeHint{0, 0, 0}
-                      : i == 10 ? LADSPA_PortRangeHint{LADSPA_HINT_BOUNDED_BELOW | LADSPA_HINT_BOUNDED_ABOVE | LADSPA_HINT_DEFAULT_1, 0.0f, 1.0f}
-                      : LADSPA_PortRangeHint{LADSPA_HINT_BOUNDED_BELOW | LADSPA_HINT_BOUNDED_ABOVE | LADSPA_HINT_DEFAULT_0, -1.0f, 1.0f};
+        for (int i = 0; i < NPORT; ++i) {
+            kPorts[i] = i < NIN ? (LADSPA_PORT_INPUT | LADSPA_PORT_AUDIO) : i < NIN + 2 ? (LADSPA_PORT_OUTPUT | LADSPA_PORT_AUDIO) : (LADSPA_PORT_INPUT | LADSPA_PORT_CONTROL);
+            kHints[i] = i < NIN + 2 ? LADSPA_PortRangeHint{0, 0, 0}
+                      : i == NPORT - 1 ? LADSPA_PortRangeHint{LADSPA_HINT_BOUNDED_BELOW | LADSPA_HINT_BOUNDED_ABOVE | LADSPA_HINT_DEFAULT_1, 0.0f, 1.0f}
+                      : LADSPA_PortRangeHint{LADSPA_HINT_BOUNDED_BELOW | LADSPA_HINT_BOUNDED_ABOVE | (i == NIN + 2 ? LADSPA_HINT_DEFAULT_1 : LADSPA_HINT_DEFAULT_0), -1.0f, 1.0f};
         }
-        kDescriptor = {0x53504436 /* "SPD6" */, "ambirot", 0, "Ambisonics HRTF renderer (spatial-audio)", "spatial-audio", "MIT", 11, kPorts, kNames, kHints, nullptr,
+        kDescriptor = {0x53504437 /* "SPD7" */, "ambirot", 0, "Ambisonics HRTF renderer, stereo and 7.1 (spatial-audio)", "spatial-audio", "MIT", NPORT, kPorts, kNames, kHints, nullptr,
                        ambiInstantiate, ambiConnect, nullptr, ambiRun, nullptr, nullptr, nullptr, ambiCleanup};
         init = true;
     }

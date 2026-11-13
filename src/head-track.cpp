@@ -213,15 +213,12 @@ struct Predictor {
     }
 };
 // ------------------------------------------------------------------------------------------ head model
-static const double SPK_AZ[2] = {30.0, -30.0};       // virtual speakers: left, right (in the room, at ear height)
-static Vec speakerDir(int s) { double a = rad(SPK_AZ[s]); return {std::cos(a), std::sin(a), 0.0}; }
+static const double SPK_AZ[2] = {30.0, -30.0};       // the stereo pair (the plugin has the whole layout); used by the tests
+[[maybe_unused]] static Vec speakerDir(int s) { double a = rad(SPK_AZ[s]); return {std::cos(a), std::sin(a), 0.0}; }
 
-// The plugin takes the speaker directions as unit vectors in the head frame (x forward, y left, z up) and fades to plain stereo with "Mix".
-static void addDirections(ParamList& p, const Quat& q) {
-    for (int ch = 0; ch < 2; ++ch) {
-        Vec v = q.rotate(speakerDir(ch)); const std::string n = "ambi:";
-        p.add(n + "X " + std::to_string(ch + 1), v.x); p.add(n + "Y " + std::to_string(ch + 1), v.y); p.add(n + "Z " + std::to_string(ch + 1), v.z);
-    }
+// The plugin keeps the speaker layout itself and takes the head rotation as a quaternion; "Mix" fades to plain stereo.
+static void addRotation(ParamList& p, const Quat& q) {
+    p.add("ambi:Q W", q.w); p.add("ambi:Q X", q.x); p.add("ambi:Q Y", q.y); p.add("ambi:Q Z", q.z);
 }
 
 // ------------------------------------------------------------------------------------------ main
@@ -262,7 +259,7 @@ int main(int argc, char** argv) {
     bool silent = false, haveLast = false;
     double last[4] = {0, 0, 0, 0}, loggedBucket = 1e9;
 
-    auto centre = [&]() { ParamList p; addDirections(p, Quat()); p.add("ambi:Mix", 1.0); push(p); haveLast = false; };   // speakers straight ahead
+    auto centre = [&]() { ParamList p; addRotation(p, Quat()); p.add("ambi:Mix", 1.0); push(p); haveLast = false; };   // speakers straight ahead
 
     printf("head-track listening on 127.0.0.1:%d for node %d\n", opt.port, opt.node); fflush(stdout);
     pollfd fds[3] = {{sock, POLLIN, 0}, {sfd, POLLIN, 0}, {pw.fd(), POLLIN, 0}};
@@ -304,7 +301,7 @@ int main(int argc, char** argv) {
         if (haveLast && !memcmp(cur, last, sizeof cur)) continue;                  // nothing audible changed
         memcpy(last, cur, sizeof cur); haveLast = true;
 
-        ParamList p; addDirections(p, aim); p.add("ambi:Mix", 1.0);
+        ParamList p; addRotation(p, aim); p.add("ambi:Mix", 1.0);
         push(p);
 
         if (FILE* sf = fopen(STATUS_FILE.c_str(), "w")) {                               // overwritten on every applied update

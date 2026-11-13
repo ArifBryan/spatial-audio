@@ -52,7 +52,7 @@ filters, all 8,802 directions) into 16 real spherical-harmonic channels (order 3
 plugin) by least squares, fits the interaural time difference in the same basis, and applies a small diffuse-field
 correction for the high-frequency energy that truncating at order 3 removes. A fixed, centre-matched correction then divides out the
 rendered response of the ±30° pair (power-domain smoothed, about a third of an octave), so a centred sound has the level and tone of the
-original stereo. The `ambirot` plugin encodes each virtual
+original stereo. The `ambirot` plugin takes eight inputs (PipeWire's 7.1 order) and encodes each virtual
 speaker at its head-frame direction (gains ramp linearly across each 64-sample block), delays each ear with a smooth
 fractional delay, and filters the 16 channels with the fixed filters. Directions are passed to the plugin as unit vectors (never
 azimuth/elevation), so there is no singularity when a speaker passes over the head. A block limiter (ceiling 0.95) guards against
@@ -60,3 +60,13 @@ clipping when the near ear gets louder, and a `Mix` control fades to plain stere
 head rotation (0 = fixed stereo, 100 = the sound stage follows exactly). Nothing is switched or interpolated between
 measurements while the head moves. Order 3 captured the filters with a relative error of about -9 dB; higher orders or
 magnitude-least-squares fitting would be the next step for sharper localisation.
+
+## Surround
+
+The filter sink is 8 channels (`FL FR FC LFE RL RR SL SR`, `channelmix.upmix = false`, so a stereo stream fills only FL and FR). The
+plugin keeps the speaker layout itself: FL/FR at ±30°, FC at 0°, SL/SR at ±90°, RL/RR at ±135° (a 5.1 stream's rears land there too),
+centre and surrounds at −3 dB, LFE added to both ears untouched. The head rotation reaches the plugin as a quaternion and the plugin
+rotates each speaker into the head frame. All speakers share the same 16 fixed filters, because they are summed in the
+Ambisonic domain before filtering, so each extra speaker only costs its encoding (a delay and 16 gains per ear). A speaker whose input
+has been silent for a few milliseconds is skipped. With Mix at 0 the plugin outputs the standard stereo downmix of its eight inputs.
+The tone calibration (`spatial-tools calibrate`) is measured with the front pair only.

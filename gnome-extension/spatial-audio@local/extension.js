@@ -96,10 +96,8 @@ const SpatialIndicator = GObject.registerClass(
 class SpatialIndicator extends QuickSettings.SystemIndicator {
     constructor(icon) {
         super();
-        this._indicator = this._addIndicator();
-        this._indicator.gicon = icon;
+        // No icon in the top bar: the Quick Settings tile alone shows the state.
         this._toggle = new SpatialToggle(icon);
-        this._toggle.bind_property('checked', this._indicator, 'visible', GObject.BindingFlags.SYNC_CREATE);
         this.quickSettingsItems.push(this._toggle);
 
         // Event driven: the daemon rewrites state.json whenever anything relevant changes.

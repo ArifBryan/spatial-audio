@@ -19,6 +19,11 @@ shows up as a separate sound device you have to select.
   in the head's frame and filtered with *fixed* filters, so head movement only changes smooth encoding gains; no
   filter is ever switched or interpolated between measurements. Up/down and tilt work. ~7 % of one CPU core while
   playing. The centred sound keeps the level and tone of the original stereo, and a limiter keeps turns from clipping.
+- **Surround (5.1 / 7.1)**: the filter is an 8-channel sink (FL FR FC LFE RL RR SL SR). Each channel becomes a virtual
+  speaker in the room (front ±30°, centre 0°, sides ±90°, rears ±135°; centre and surrounds at −3 dB like a standard
+  downmix; the LFE goes to both ears) and turns with your head. Stereo content uses only the front pair and sounds as
+  before; speakers with no signal cost nothing. Players that send surround to the default output (mpv, VLC, games)
+  just work; browsers usually send stereo.
 - **Android-style auto-recenter**: after your head has been still for ~2 s, wherever you face becomes the new front.
 - **Click-free**: smooth fractional delays, rotation (quaternion) smoothing, and directions passed as vectors, not angles: no
   snaps at 180°, no flips when looking straight down.
